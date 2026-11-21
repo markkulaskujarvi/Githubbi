@@ -50,18 +50,36 @@
   </style>
 </head>
 <body>
+  <!-- THE 3D SCENE
+       <a-scene> is A-Frame's 3D world. The word "game" on it attaches our own
+       game component (written in the script further down).
+       vr-mode-ui and device-orientation-permission-ui are switched off because
+       this game is played on a flat screen, not in a VR headset.
+       "fog" fades far-away walls into the sky color, which adds depth. -->
   <a-scene id="scene" game vr-mode-ui="enabled: false" device-orientation-permission-ui="enabled: false"
            renderer="antialias: true" fog="type: exponential; color: #9fb7d6; density: 0.045"
            loading-screen="dotsColor: #5fd4ff; backgroundColor: #1b2233">
+    <!-- A big sphere around everything that gives the world a sky color. -->
     <a-sky color="#9fb7d6"></a-sky>
+    <!-- Two lights: "ambient" lights every surface evenly, and "directional"
+         shines from one direction like the sun, so walls get light and dark sides. -->
     <a-entity light="type: ambient; intensity: 0.7; color: #ffffff"></a-entity>
     <a-entity light="type: directional; intensity: 0.8" position="-3 8 4"></a-entity>
+    <!-- An empty container. The script fills it with the floor, walls and crystals. -->
     <a-entity id="world"></a-entity>
+    <!-- The player. The "rig" is an invisible body that the script moves and
+         turns. The camera (your eyes) sits inside it, 1.6 m up at head height.
+         A-Frame's built-in look-controls and wasd-controls are switched off,
+         because the script handles walking and looking itself. -->
     <a-entity id="rig">
       <a-entity id="cam" camera position="0 1.6 0" look-controls="enabled: false" wasd-controls="enabled: false"></a-entity>
     </a-entity>
   </a-scene>
 
+  <!-- On-screen controls and text, drawn on top of the 3D view.
+       #controls is an invisible layer covering the screen that catches touches.
+       The two "stick" circles are the joystick, shown only while you touch.
+       #hud shows the crystal count and timer. -->
   <div id="controls"></div>
   <div id="stickBase" class="stick"></div>
   <div id="stickKnob" class="stick"></div>
@@ -69,6 +87,8 @@
   <div id="hint"><span>Left side: drag to move</span><span>Right side: drag to look</span></div>
   <button id="fsBtn" type="button">Fullscreen</button>
 
+  <!-- The start screen and the win screen. "hidden" keeps the win screen
+       invisible until the script reveals it. -->
   <div id="startPanel" class="panel">
     <div>
       <h1>Crystal Maze</h1>
@@ -87,7 +107,49 @@
   </div>
 
   <script>
-    // Maze layout: # wall, . floor, S start, C crystal
+    /* =====================================================================
+       CRYSTAL MAZE: HOW THIS PROGRAM WORKS
+       =====================================================================
+       This script is the "brain" of the game. The HTML above only sets up an
+       empty 3D scene (sky, lights, a camera). Everything else, building the
+       maze, moving the player, collecting crystals and reacting to your
+       fingers, happens here in JavaScript.
+
+       The script has four parts:
+         1. SETTINGS    – the maze map and a few numbers that tune the game.
+         2. THE GAME    – an A-Frame "component" that builds the 3D world and
+                          updates it many times per second.
+         3. CONTROLS    – code that listens to touches, the mouse and the
+                          keyboard, and turns them into movement and looking.
+         4. BUTTONS     – the Start, Play again and Fullscreen buttons.
+
+       A note on 3D coordinates (positions in space):
+         Every point in the 3D world is described by three numbers: x, y, z.
+           x = left / right       (bigger x = further east, to the right on the map)
+           y = up / down          (bigger y = higher up; the floor is at y = 0)
+           z = forward / backward (bigger z = further south, down the map)
+         Units are meters. Because we walk on a flat floor, most of the game
+         logic only needs x and z.
+       ===================================================================== */
+
+
+    /* ---------------------------------------------------------------------
+       PART 1: SETTINGS
+       --------------------------------------------------------------------- */
+
+    // The maze map, drawn with text. Each string is one row of the maze
+    // (top row first), and each character is one square "cell" of the floor:
+    //   #  = a wall block
+    //   .  = an empty floor cell you can walk on
+    //   S  = where the player Starts
+    //   C  = a Crystal to collect
+    //
+    // Try editing it! Keep the outer border made of '#' so the player can't
+    // walk off the edge, and make sure every row has the same length.
+    // Adding more 'C' characters automatically adds more crystals.
+    //
+    // "const" means this variable will never be replaced by something else.
+    // The square brackets [ ] make an "array": an ordered list of values.
     const MAZE = [
       "###########",
       "#S....#..C#",
@@ -101,202 +163,529 @@
       "#C....#..C#",
       "###########"
     ];
+
+    // Numbers that tune the game. Change them to see what happens:
+    //   CELL    – how wide (in meters) each cell of the map is in the 3D world.
+    //             A '#' becomes a 4 x 4 meter block.
+    //   WALL_H  – how tall the walls are, in meters.
+    //   RADIUS  – how "fat" the player is. We treat the player as a small
+    //             square this far out from their center, so they can't press
+    //             their nose right into a wall.
+    //   SPEED   – walking speed in meters per second.
+    //   PICKUP  – how close (in meters) you must get to a crystal to grab it.
     const CELL = 4, WALL_H = 3, RADIUS = 0.35, SPEED = 3.5, PICKUP = 1.3;
 
+    // "input" collects what the player is currently asking for.
+    //   moveX – sideways from the on-screen joystick: -1 = full left,
+    //           0 = none, +1 = full right.
+    //   moveY – forward/back from the joystick: +1 = full forward,
+    //           -1 = full backward.
+    //   keys  – which keyboard keys are held down right now, for example
+    //           { KeyW: true } while the W key is pressed.
+    // The curly braces { } make an "object": a bundle of named values.
     const input = { moveX: 0, moveY: 0, keys: {} };
+
+    // Which way the player is looking. Angles are in "radians", the unit
+    // that JavaScript's math functions use. A full circle is 2 × π radians
+    // (about 6.28), so a quarter turn is π / 2 (about 1.57).
+    //   yaw   – turning left/right, like shaking your head "no".
+    //   pitch – tilting up/down, like nodding "yes".
+    // "let" (instead of "const") means these values will change later.
     let yaw = 0, pitch = 0;
 
+
+    /* ---------------------------------------------------------------------
+       PART 2: THE GAME COMPONENT
+       ---------------------------------------------------------------------
+       A-Frame is a library that lets us build 3D scenes with HTML-like tags
+       such as <a-box> and <a-sky>. To add our own behavior we "register a
+       component": an object containing functions that A-Frame calls for us
+       at the right moments:
+         init() – called once, when the scene starts.
+         tick() – called again and again, once for every frame drawn on the
+                  screen (usually 60 times per second). This is the
+                  "game loop".
+       In the HTML, the <a-scene> tag has the word "game" on it. That
+       attaches this component to the scene.
+
+       Inside these functions, "this" means "the component itself", so
+       this.crystals is a value that belongs to the game and can be used by
+       every one of its functions.
+       --------------------------------------------------------------------- */
     AFRAME.registerComponent('game', {
+
+      // init: set everything up once.
       init() {
+        // Find the 3D objects we declared in the HTML by their id="...".
+        //   rig   – an invisible "body" that we move around the maze.
+        //   cam   – the camera (the player's eyes), placed inside the rig at
+        //           head height. When the rig moves, the camera moves with it.
+        //   world – an empty container we fill with the floor, walls and crystals.
         this.rig = document.getElementById('rig');
         this.cam = document.getElementById('cam');
         this.world = document.getElementById('world');
+
+        // An empty list that buildWorld() will fill with one entry per crystal.
         this.crystals = [];
+
+        // false = the game is paused (for example while the Start screen
+        // shows). The player can only move while this is true.
         this.running = false;
-        this.buildWorld();
-        this.reset();
+
+        this.buildWorld();  // turn the text map into 3D objects
+        this.reset();       // put the player at the start, reset the timer
       },
 
+      // isWall: is the point (x, z) inside a wall?
+      // It converts a 3D position back into a row and column of the MAZE map
+      // and checks which character is there.
       isWall(x, z) {
+        // The center of cell number "col" sits at x = col × CELL, so each cell
+        // reaches from half a cell before its center to half a cell after.
+        // Dividing by CELL and adding 0.5 before rounding down (Math.floor)
+        // gives us the cell number that the point falls into.
+        // Example with CELL = 4: x = 5.0 → 5 / 4 + 0.5 = 1.75 → column 1.
         const col = Math.floor(x / CELL + 0.5), row = Math.floor(z / CELL + 0.5);
+
+        // Look up that row's string. If the row doesn't exist (we're outside
+        // the map), "line" will be undefined.
         const line = MAZE[row];
+
+        // Count it as a wall if:
+        //   - the row doesn't exist (!line means "line is missing"), or
+        //   - the column doesn't exist in that row, or
+        //   - the character there is '#'.
+        // The || operator means "or". Treating the outside of the map as a
+        // wall is a safety net: you can never fall off the world.
         return !line || line[col] === undefined || line[col] === '#';
       },
 
+      // blocked: would the player bump into a wall if they stood at (x, z)?
+      // The player isn't a single point: they are RADIUS wide in every
+      // direction. So we check the four corners of a small square around
+      // them. If any corner is inside a wall, the spot is blocked.
+      //
+      //      (x-R, z-R) ●-----● (x+R, z-R)
+      //                 |  ☺  |        ☺ = the player's center (x, z)
+      //      (x-R, z+R) ●-----● (x+R, z+R)
       blocked(x, z) {
         return this.isWall(x - RADIUS, z - RADIUS) || this.isWall(x + RADIUS, z - RADIUS) ||
                this.isWall(x - RADIUS, z + RADIUS) || this.isWall(x + RADIUS, z + RADIUS);
       },
 
+      // buildWorld: read the MAZE text and create a 3D object for each symbol.
       buildWorld() {
+        // How big is the map? .length gives the number of items in an array
+        // (the rows) or characters in a string (the columns).
         const rows = MAZE.length, cols = MAZE[0].length;
+
+        // --- The floor ---
+        // document.createElement makes a new tag, just as if we had typed
+        // <a-plane> into the HTML. setAttribute sets its properties.
         const floor = document.createElement('a-plane');
+
+        // A plane starts out standing up like a wall. Rotating it -90 degrees
+        // around the x axis tips it over so it lies flat.
         floor.setAttribute('rotation', '-90 0 0');
+
+        // Make it big enough to cover the whole map...
         floor.setAttribute('width', cols * CELL);
         floor.setAttribute('height', rows * CELL);
+
+        // ...and move its center to the middle of the map. The backticks ` `
+        // make a "template string": anything inside ${ } is calculated and
+        // inserted into the text. For our 11 x 11 map this gives "20 0 20".
         floor.setAttribute('position', `${(cols - 1) * CELL / 2} 0 ${(rows - 1) * CELL / 2}`);
+
+        // "material" controls how a surface looks. "roughness: 1" means fully
+        // matte, with no shine.
         floor.setAttribute('material', 'color: #c9d3c0; roughness: 1');
+
+        // Nothing appears until we add the new object to the scene.
         this.world.appendChild(floor);
 
+        // --- Walls, start point and crystals ---
+        // Go through every row of the map. forEach runs the function we give
+        // it once per item, and hands it the item ("line") and its position
+        // in the list ("row", counting from 0).
         MAZE.forEach((line, row) => {
+
+          // [...line] splits the string into a list of single characters, so
+          // that we can go through every character ("ch") and its column.
           [...line].forEach((ch, col) => {
+
+            // Where the center of this cell is in the 3D world.
             const x = col * CELL, z = row * CELL;
+
             if (ch === '#') {
+              // A WALL: a box exactly one cell wide and deep, WALL_H tall.
               const wall = document.createElement('a-box');
+
+              // A box's position is its center, so we raise it by half its
+              // height. That way its bottom sits on the floor (y = 0) instead
+              // of being half buried in it.
               wall.setAttribute('position', `${x} ${WALL_H / 2} ${z}`);
               wall.setAttribute('width', CELL);
               wall.setAttribute('depth', CELL);
               wall.setAttribute('height', WALL_H);
+
+              // Pick one of two slightly different blues, like a checkerboard,
+              // so the walls don't blend into one flat surface.
+              // (row + col) % 2 is the remainder after dividing by 2: it is 0
+              // or 1, alternating from one cell to the next.
+              // The "condition ? a : b" form means "if condition, use a,
+              // otherwise use b".
               const shade = (row + col) % 2 ? '#6c7fa3' : '#62749a';
               wall.setAttribute('material', `color: ${shade}; roughness: 0.9`);
               this.world.appendChild(wall);
+
             } else if (ch === 'S') {
+              // THE START: no object to draw, just remember where it is so
+              // reset() can put the player here.
               this.start = { x, z };
+
             } else if (ch === 'C') {
+              // A CRYSTAL: an octahedron (a shape with 8 triangle faces, like
+              // two pyramids stuck together).
               const c = document.createElement('a-octahedron');
               c.setAttribute('radius', 0.4);
+
+              // Float it at about chest height (1.2 m) above the cell's center.
               c.setAttribute('position', `${x} 1.2 ${z}`);
+
+              // "emissive" makes the crystal give off its own light color, so
+              // it glows even in shadow and is easy to spot.
               c.setAttribute('material', 'color: #5fd4ff; emissive: #2aa8e0; emissiveIntensity: 0.8; metalness: 0.2; roughness: 0.3');
+
+              // A-Frame's animation component animates objects without any
+              // code in tick(). This one spins the crystal a full 360 degrees
+              // around its vertical (y) axis every 3000 ms (3 seconds),
+              // forever (loop: true), at a constant speed (easing: linear).
               c.setAttribute('animation', 'property: rotation; to: 0 360 0; loop: true; dur: 3000; easing: linear');
+
+              // A second animation (the "__bob" part just gives it its own
+              // name) moves the crystal smoothly up and down between 1.1 m and
+              // 1.4 m. "dir: alternate" means it goes up, then back down,
+              // instead of jumping back to the start each time.
               c.setAttribute('animation__bob', 'property: position; from: ' + `${x} 1.1 ${z}` + '; to: ' + `${x} 1.4 ${z}` + '; dir: alternate; loop: true; dur: 1200; easing: easeInOutSine');
               this.world.appendChild(c);
+
+              // Remember this crystal so the game loop can check whether the
+              // player is touching it:
+              //   el    – the 3D object itself, so we can hide it later
+              //   x, z  – where it is
+              //   taken – whether it has been collected yet
+              // ({ el: c, x, z } is shorthand for { el: c, x: x, z: z }.)
               this.crystals.push({ el: c, x, z, taken: false });
             }
+            // A '.' needs nothing: the floor is already there.
           });
         });
       },
 
+      // reset: start a fresh round. Called at the beginning and on "Play again".
       reset() {
+        // Put the player back on the start cell.
         this.pos = { x: this.start.x, z: this.start.z };
-        yaw = Math.PI / 2 * -1; // face east, down the first corridor
-        pitch = 0;
+
+        // Face east (toward +x), down the first corridor.
+        // In this 3D world, a yaw of 0 looks north (toward -z). Turning by a
+        // negative quarter circle (-π / 2) turns right, to face east.
+        yaw = Math.PI / 2 * -1;
+        pitch = 0;  // look straight ahead, not up or down
+
+        // Make every crystal collectable and visible again.
         this.crystals.forEach(c => { c.taken = false; c.el.setAttribute('visible', true); });
-        this.found = 0;
-        this.elapsed = 0;
+
+        this.found = 0;    // crystals collected so far
+        this.elapsed = 0;  // seconds since the round started
         this.updateHud();
       },
 
+      // updateHud: refresh the text at the top of the screen.
+      // (HUD = "heads-up display", the information drawn over the game.)
       updateHud() {
         document.getElementById('count').textContent = `Crystals ${this.found}/${this.crystals.length}`;
+        // toFixed(1) rounds to one digit after the decimal point: 12.3456 → "12.3".
         document.getElementById('time').textContent = `${this.elapsed.toFixed(1)} s`;
       },
 
+      // tick: THE GAME LOOP. A-Frame calls this before drawing every frame.
+      //   t    – total time since the scene started (we don't use it)
+      //   dtMs – "delta time": how many milliseconds passed since last frame
       tick(t, dtMs) {
+        // Convert milliseconds to seconds (1 second = 1000 ms).
+        // Why use delta time at all? Some devices draw 30 frames per second,
+        // others 120. If we moved a fixed amount every frame, the game would
+        // run faster on fast devices. Moving SPEED × dt instead means you
+        // always walk SPEED meters per second, whatever the frame rate.
+        // Math.min caps dt at 0.1 s: if the tablet pauses (say you switch
+        // apps), we don't want one giant jump that skips through a wall.
+        // (dtMs || 0) uses 0 if dtMs happens to be missing.
         const dt = Math.min((dtMs || 0) / 1000, 0.1);
+
         if (this.running) {
+
+          // --- 1. Work out which way the player wants to go ---
+          // Start with the on-screen joystick values...
           let mx = input.moveX, my = input.moveY;
+
+          // ...then add any keyboard keys being held. e.code names the key's
+          // position on the keyboard ("KeyW"), not the letter it types.
           const k = input.keys;
-          if (k.KeyW || k.ArrowUp) my += 1;
-          if (k.KeyS || k.ArrowDown) my -= 1;
-          if (k.KeyA || k.ArrowLeft) mx -= 1;
-          if (k.KeyD || k.ArrowRight) mx += 1;
+          if (k.KeyW || k.ArrowUp) my += 1;     // forward
+          if (k.KeyS || k.ArrowDown) my -= 1;   // backward
+          if (k.KeyA || k.ArrowLeft) mx -= 1;   // step left
+          if (k.KeyD || k.ArrowRight) mx += 1;  // step right
+
+          // Holding W and D together gives mx = 1, my = 1. Going diagonally
+          // like that would be about 1.41 times faster than going straight
+          // (Pythagoras: √(1² + 1²) ≈ 1.41). Math.hypot calculates that
+          // length. If it's over 1, we shrink both numbers so the length is
+          // exactly 1: diagonal moves become the same speed as straight ones.
           const len = Math.hypot(mx, my);
           if (len > 1) { mx /= len; my /= len; }
 
+          // --- 2. Turn "forward/sideways" into "east/south" ---
+          // "Forward" depends on where you are facing. We use sine and cosine
+          // (trigonometry) of the yaw angle to rotate the movement:
+          //   forward direction on the map = (-sin(yaw), -cos(yaw))
+          //   right   direction on the map = ( cos(yaw), -sin(yaw))
+          // Movement = right × mx + forward × my. Writing that out separately
+          // for x and z gives the two lines below. Then we multiply by SPEED
+          // and dt to get how many meters to move during this frame.
+          //
+          // You don't need to fully follow the math: try changing yaw in your
+          // head to 0 (facing north, -z). Then sin = 0 and cos = 1, so
+          // dx = mx (sideways moves along x) and dz = -my (forward moves
+          // toward -z, north). That's exactly what we want.
           const sin = Math.sin(yaw), cos = Math.cos(yaw);
           const dx = (cos * mx - sin * my) * SPEED * dt;
           const dz = (-sin * mx - cos * my) * SPEED * dt;
+
+          // --- 3. Move, unless a wall is in the way ---
+          // We try the x step and the z step separately. This trick lets you
+          // "slide" along walls: if you walk diagonally into a wall, the
+          // blocked direction is cancelled but the other one still works,
+          // instead of you getting stuck.
+          // The ! means "not": "if NOT blocked, then move".
           if (!this.blocked(this.pos.x + dx, this.pos.z)) this.pos.x += dx;
           if (!this.blocked(this.pos.x, this.pos.z + dz)) this.pos.z += dz;
 
+          // --- 4. Collect any crystal we're close to ---
+          // Check every crystal. Math.hypot gives the straight-line distance
+          // between the player and the crystal on the map. If the crystal
+          // isn't taken yet (!c.taken) and the distance is less than PICKUP
+          // (&& means "and"), we collect it.
           for (const c of this.crystals) {
             if (!c.taken && Math.hypot(c.x - this.pos.x, c.z - this.pos.z) < PICKUP) {
-              c.taken = true;
-              c.el.setAttribute('visible', false);
-              this.found++;
+              c.taken = true;                       // can't collect it twice
+              c.el.setAttribute('visible', false);  // hide it from view
+              this.found++;                         // ++ adds 1 to the count
             }
           }
-          this.elapsed += dt;
+
+          // --- 5. Update the timer and check for a win ---
+          this.elapsed += dt;  // += adds dt to the running total
           this.updateHud();
+          // === means "is exactly equal to".
           if (this.found === this.crystals.length) this.win();
         }
+
+        // --- 6. Show the result on screen ---
+        // This runs even while paused, so the view is always correct.
+        // object3D is the underlying three.js object that A-Frame draws.
+        // We move the whole body (rig) to the player's position...
         this.rig.object3D.position.set(this.pos.x, 0, this.pos.z);
+        // ...turn the body left/right...
         this.rig.object3D.rotation.y = yaw;
+        // ...and tilt only the head (camera) up/down. Keeping them separate
+        // means looking up at the sky never makes you walk into the sky.
         this.cam.object3D.rotation.x = pitch;
       },
 
+      // win: called when every crystal has been collected.
       win() {
-        this.running = false;
+        this.running = false;  // stop the player and the timer
         document.getElementById('winText').textContent =
           `You collected all ${this.crystals.length} crystals in ${this.elapsed.toFixed(1)} seconds.`;
+        // The win panel was hidden with the "hidden" attribute. Setting it
+        // to false makes the panel appear.
         document.getElementById('winPanel').hidden = false;
       }
     });
 
-    // ---- Touch and mouse controls ----
+
+    /* ---------------------------------------------------------------------
+       PART 3: TOUCH, MOUSE AND KEYBOARD CONTROLS
+       ---------------------------------------------------------------------
+       An invisible layer (<div id="controls">) covers the whole screen and
+       catches every touch. We use "pointer events", which work the same
+       way for fingers, a mouse and a stylus. Each finger on the screen gets
+       its own number, the pointerId, so we can follow several fingers at
+       once (one walking, one looking).
+
+       The plan:
+         - A finger that lands on the LEFT half becomes the joystick finger.
+         - Any other finger (or the mouse) is a "look" finger: dragging it
+           turns the view.
+       --------------------------------------------------------------------- */
     const controls = document.getElementById('controls');
-    const base = document.getElementById('stickBase');
-    const knob = document.getElementById('stickKnob');
-    const STICK_R = 60;
+    const base = document.getElementById('stickBase');  // the joystick's outer ring
+    const knob = document.getElementById('stickKnob');  // the dot you drag around
+    const STICK_R = 60;  // how far (in screen pixels) the knob can move from the center
+
+    // movePointer – the id of the finger currently using the joystick, or
+    //               null ("nothing") when no finger is.
+    // moveOrigin  – where that finger first touched down: the joystick's center.
     let movePointer = null, moveOrigin = null;
+
+    // A Map is like a small address book: it stores a value under a key.
+    // Here: finger id → the last screen position where we saw that finger.
     const lookPointers = new Map();
 
+    // addEventListener says: "when this happens, run this function".
+    // 'pointerdown' happens when a finger touches the screen or a mouse
+    // button is pressed. "e" (the event) tells us where and with what.
     controls.addEventListener('pointerdown', e => {
+      // "Capture" the pointer so we keep getting its moves even if it slides
+      // over a button or off the edge. try/catch means: if this fails on
+      // some browser, ignore the error instead of stopping the game.
       try { controls.setPointerCapture(e.pointerId); } catch (err) {}
+
+      // Is this a new joystick finger? It must be:
+      //   - a touch, not the mouse (pointerType !== 'mouse'; !== means "is not"),
+      //   - on the left half of the screen (x smaller than half the width),
+      //   - and no other finger is already using the joystick.
       if (e.pointerType !== 'mouse' && e.clientX < window.innerWidth / 2 && movePointer === null) {
         movePointer = e.pointerId;
         moveOrigin = { x: e.clientX, y: e.clientY };
+
+        // Show the joystick ring and knob right under the finger.
+        // (The joystick appears wherever you touch, so you never have to
+        // look for it.)
         for (const el of [base, knob]) {
           el.style.display = 'block';
           el.style.left = e.clientX + 'px';
           el.style.top = e.clientY + 'px';
         }
       } else {
+        // Otherwise it's a look finger: remember where it started.
         lookPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
       }
     });
 
+    // 'pointermove' happens every time a finger (or the mouse) moves.
     controls.addEventListener('pointermove', e => {
       if (e.pointerId === movePointer) {
+        // --- The joystick finger moved ---
+        // How far is the finger from where it first touched down?
+        // On screens, y grows DOWNWARD, so dragging up gives a negative dy.
         let dx = e.clientX - moveOrigin.x, dy = e.clientY - moveOrigin.y;
+
+        // If the finger has gone further than STICK_R, shrink the distance
+        // back to STICK_R (keeping the same direction). This keeps the knob
+        // inside its ring, and caps the speed at full speed.
         const d = Math.hypot(dx, dy);
         if (d > STICK_R) { dx *= STICK_R / d; dy *= STICK_R / d; }
+
+        // Draw the knob at its new spot.
         knob.style.left = (moveOrigin.x + dx) + 'px';
         knob.style.top = (moveOrigin.y + dy) + 'px';
+
+        // Turn pixels into the -1 to +1 range the game loop expects.
+        // dy is flipped (the minus sign), so dragging UP means FORWARD.
         input.moveX = dx / STICK_R;
         input.moveY = -dy / STICK_R;
+
       } else if (lookPointers.has(e.pointerId)) {
+        // --- A look finger (or the mouse) moved ---
         const last = lookPointers.get(e.pointerId);
+
+        // Sensitivity: how many radians to turn per pixel dragged. Fingers
+        // get a little more than the mouse, because tablet screens are small.
+        // Make these numbers bigger to turn faster.
         const sens = e.pointerType === 'mouse' ? 0.004 : 0.006;
+
+        // Dragging right turns you right. Turning right means a smaller yaw,
+        // hence the minus sign (-=). The same goes for up/down with pitch.
         yaw -= (e.clientX - last.x) * sens;
         pitch -= (e.clientY - last.y) * sens;
+
+        // Clamp pitch between -1.2 and 1.2 radians (about 69 degrees), so you
+        // can't tilt your head so far that the world turns upside down.
+        // Math.min picks the smaller number, Math.max the bigger, so together
+        // they keep the value inside the range.
         pitch = Math.max(-1.2, Math.min(1.2, pitch));
+
+        // Remember this position, to measure the next move from here.
         lookPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
       }
     });
 
+    // endPointer: a finger was lifted (or the mouse button released).
     function endPointer(e) {
       if (e.pointerId === movePointer) {
+        // The joystick finger let go: stop walking and hide the joystick.
         movePointer = null;
         input.moveX = input.moveY = 0;
         base.style.display = knob.style.display = 'none';
       }
+      // Forget this finger if it was a look finger.
       lookPointers.delete(e.pointerId);
     }
     controls.addEventListener('pointerup', endPointer);
+    // 'pointercancel' happens when the system interrupts a touch (for
+    // example a notification or a system gesture). Treat it like letting go.
     controls.addEventListener('pointercancel', endPointer);
+    // Stop the right-click menu (or a long-press menu) from popping up.
     controls.addEventListener('contextmenu', e => e.preventDefault());
 
+    // Keyboard: remember which keys are held down. The game loop reads
+    // input.keys every frame, so holding a key keeps you moving.
     window.addEventListener('keydown', e => { input.keys[e.code] = true; });
     window.addEventListener('keyup', e => { input.keys[e.code] = false; });
+    // "blur" happens when the window loses focus (you switch tabs or apps).
+    // We may never see those keys being released, so forget them all,
+    // otherwise the player would keep walking on their own.
     window.addEventListener('blur', () => { input.keys = {}; });
 
-    // ---- Panels ----
+
+    /* ---------------------------------------------------------------------
+       PART 4: BUTTONS AND PANELS
+       --------------------------------------------------------------------- */
+
+    // A small helper that finds our game component, so the buttons can talk
+    // to it. A-Frame keeps every component attached to an object in its
+    // .components list, under the component's name.
     function game() { return document.getElementById('scene').components.game; }
+
+    // Start button: hide the start panel, reset the round and let the
+    // player move.
     document.getElementById('startBtn').addEventListener('click', () => {
       document.getElementById('startPanel').hidden = true;
       const g = game(); g.reset(); g.running = true;
     });
+
+    // Play again button: the same, but for the win panel.
     document.getElementById('againBtn').addEventListener('click', () => {
       document.getElementById('winPanel').hidden = true;
       const g = game(); g.reset(); g.running = true;
     });
+
+    // Fullscreen button: switch fullscreen on, or off if it is already on.
+    // Some browsers (older Safari on iPad) use names starting with "webkit",
+    // so we try the standard name first and fall back to the webkit one.
     document.getElementById('fsBtn').addEventListener('click', () => {
-      const el = document.documentElement;
+      const el = document.documentElement;  // the whole page
       const req = el.requestFullscreen || el.webkitRequestFullscreen;
       if (document.fullscreenElement || document.webkitFullscreenElement) {
+        // Already fullscreen: leave it.
         (document.exitFullscreen || document.webkitExitFullscreen).call(document);
       } else if (req) {
+        // Ask for fullscreen. The browser may refuse (some phones don't
+        // allow it). .catch(() => {}) quietly ignores a refusal, so the game
+        // keeps working in a normal window.
         Promise.resolve(req.call(el)).catch(() => {});
       }
     });
