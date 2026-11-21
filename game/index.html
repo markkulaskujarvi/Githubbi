@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Crystal Maze</title>
+  <script src="https://cdn.jsdelivr.net/npm/aframe@1.6.0/dist/aframe-master.min.js"></script>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #1b2233; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+    #controls {
+      position: fixed; inset: 0; z-index: 10;
+      touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+    }
+    #hud {
+      position: fixed; z-index: 20; pointer-events: none;
+      top: calc(12px + env(safe-area-inset-top, 0px)); left: 0; right: 0;
+      display: flex; justify-content: center; gap: 12px;
+      color: #fff; font-size: 18px; font-variant-numeric: tabular-nums;
+    }
+    #hud span { background: rgba(0,0,0,.45); padding: 6px 14px; border-radius: 999px; }
+    #hint {
+      position: fixed; z-index: 20; pointer-events: none;
+      bottom: calc(16px + env(safe-area-inset-bottom, 0px)); left: 0; right: 0;
+      display: flex; justify-content: space-between; padding: 0 24px;
+      color: #fff; font-size: 14px;
+    }
+    #hint span { background: rgba(0,0,0,.45); padding: 6px 12px; border-radius: 999px;
+    }
+    .stick { position: fixed; z-index: 15; pointer-events: none; border-radius: 50%; display: none; transform: translate(-50%, -50%); }
+    #stickBase { width: 140px; height: 140px; border: 2px solid rgba(255,255,255,.5); background: rgba(255,255,255,.08); }
+    #stickKnob { width: 60px; height: 60px; background: rgba(255,255,255,.6); }
+    .panel {
+      position: fixed; inset: 0; z-index: 30;
+      display: grid; place-items: center; background: rgba(10,14,24,.75);
+      color: #fff; text-align: center; padding: 16px;
+    }
+    .panel[hidden] { display: none; }
+    .panel h1 { margin: 0 0 8px; font-size: 40px; }
+    .panel p { margin: 0 0 20px; font-size: 18px; max-width: 32em; line-height: 1.5; }
+    .panel button {
+      font: inherit; font-size: 20px; padding: 14px 32px; border: 0; border-radius: 12px;
+      background: #5fd4ff; color: #0d1a2b; font-weight: 700; cursor: pointer;
+    }
+    #fsBtn {
+      position: fixed; z-index: 20; top: calc(12px + env(safe-area-inset-top, 0px)); right: 12px;
+      font: inherit; font-size: 14px; padding: 8px 12px; border: 0; border-radius: 8px;
+      background: rgba(0,0,0,.45); color: #fff;
+    }
+  </style>
+</head>
+<body>
+  <a-scene id="scene" game vr-mode-ui="enabled: false" device-orientation-permission-ui="enabled: false"
+           renderer="antialias: true" fog="type: exponential; color: #9fb7d6; density: 0.045"
+           loading-screen="dotsColor: #5fd4ff; backgroundColor: #1b2233">
+    <a-sky color="#9fb7d6"></a-sky>
+    <a-entity light="type: ambient; intensity: 0.7; color: #ffffff"></a-entity>
+    <a-entity light="type: directional; intensity: 0.8" position="-3 8 4"></a-entity>
+    <a-entity id="world"></a-entity>
+    <a-entity id="rig">
+      <a-entity id="cam" camera position="0 1.6 0" look-controls="enabled: false" wasd-controls="enabled: false"></a-entity>
+    </a-entity>
+  </a-scene>
+
+  <div id="controls"></div>
+  <div id="stickBase" class="stick"></div>
+  <div id="stickKnob" class="stick"></div>
+  <div id="hud"><span id="count">Crystals 0/0</span><span id="time">0.0 s</span></div>
+  <div id="hint"><span>Left side: drag to move</span><span>Right side: drag to look</span></div>
+  <button id="fsBtn" type="button">Fullscreen</button>
+
+  <div id="startPanel" class="panel">
+    <div>
+      <h1>Crystal Maze</h1>
+      <p>Walk through the maze and collect every glowing crystal as fast as you can.<br>
+         Drag on the left half of the screen to walk and on the right half to look around.
+         On a keyboard, use WASD or the arrow keys and drag the mouse to look.</p>
+      <button id="startBtn" type="button">Start</button>
+    </div>
+  </div>
+  <div id="winPanel" class="panel" hidden>
+    <div>
+      <h1>All crystals found!</h1>
+      <p id="winText"></p>
+      <button id="againBtn" type="button">Play again</button>
+    </div>
+  </div>
+
+  <script>
+    // Maze layout: # wall, . floor, S start, C crystal
+    const MAZE = [
+      "###########",
+      "#S....#..C#",
+      "#.###.#.#.#",
+      "#.#C..#.#.#",
+      "#.#.###.#.#",
+      "#.#..C..#.#",
+      "#.#####.#.#",
+      "#C..#...#.#",
+      "###.#.###.#",
+      "#C....#..C#",
+      "###########"
+    ];
+    const CELL = 4, WALL_H = 3, RADIUS = 0.35, SPEED = 3.5, PICKUP = 1.3;
+
+    const input = { moveX: 0, moveY: 0, keys: {} };
+    let yaw = 0, pitch = 0;
+
+    AFRAME.registerComponent('game', {
+      init() {
+        this.rig = document.getElementById('rig');
+        this.cam = document.getElementById('cam');
+        this.world = document.getElementById('world');
+        this.crystals = [];
+        this.running = false;
+        this.buildWorld();
+        this.reset();
+      },
+
+      isWall(x, z) {
+        const col = Math.floor(x / CELL + 0.5), row = Math.floor(z / CELL + 0.5);
+        const line = MAZE[row];
+        return !line || line[col] === undefined || line[col] === '#';
+      },
+
+      blocked(x, z) {
+        return this.isWall(x - RADIUS, z - RADIUS) || this.isWall(x + RADIUS, z - RADIUS) ||
+               this.isWall(x - RADIUS, z + RADIUS) || this.isWall(x + RADIUS, z + RADIUS);
+      },
+
+      buildWorld() {
+        const rows = MAZE.length, cols = MAZE[0].length;
+        const floor = document.createElement('a-plane');
+        floor.setAttribute('rotation', '-90 0 0');
+        floor.setAttribute('width', cols * CELL);
+        floor.setAttribute('height', rows * CELL);
+        floor.setAttribute('position', `${(cols - 1) * CELL / 2} 0 ${(rows - 1) * CELL / 2}`);
+        floor.setAttribute('material', 'color: #c9d3c0; roughness: 1');
+        this.world.appendChild(floor);
+
+        MAZE.forEach((line, row) => {
+          [...line].forEach((ch, col) => {
+            const x = col * CELL, z = row * CELL;
+            if (ch === '#') {
+              const wall = document.createElement('a-box');
+              wall.setAttribute('position', `${x} ${WALL_H / 2} ${z}`);
+              wall.setAttribute('width', CELL);
+              wall.setAttribute('depth', CELL);
+              wall.setAttribute('height', WALL_H);
+              const shade = (row + col) % 2 ? '#6c7fa3' : '#62749a';
+              wall.setAttribute('material', `color: ${shade}; roughness: 0.9`);
+              this.world.appendChild(wall);
+            } else if (ch === 'S') {
+              this.start = { x, z };
+            } else if (ch === 'C') {
+              const c = document.createElement('a-octahedron');
+              c.setAttribute('radius', 0.4);
+              c.setAttribute('position', `${x} 1.2 ${z}`);
+              c.setAttribute('material', 'color: #5fd4ff; emissive: #2aa8e0; emissiveIntensity: 0.8; metalness: 0.2; roughness: 0.3');
+              c.setAttribute('animation', 'property: rotation; to: 0 360 0; loop: true; dur: 3000; easing: linear');
+              c.setAttribute('animation__bob', 'property: position; from: ' + `${x} 1.1 ${z}` + '; to: ' + `${x} 1.4 ${z}` + '; dir: alternate; loop: true; dur: 1200; easing: easeInOutSine');
+              this.world.appendChild(c);
+              this.crystals.push({ el: c, x, z, taken: false });
+            }
+          });
+        });
+      },
+
+      reset() {
+        this.pos = { x: this.start.x, z: this.start.z };
+        yaw = Math.PI / 2 * -1; // face east, down the first corridor
+        pitch = 0;
+        this.crystals.forEach(c => { c.taken = false; c.el.setAttribute('visible', true); });
+        this.found = 0;
+        this.elapsed = 0;
+        this.updateHud();
+      },
+
+      updateHud() {
+        document.getElementById('count').textContent = `Crystals ${this.found}/${this.crystals.length}`;
+        document.getElementById('time').textContent = `${this.elapsed.toFixed(1)} s`;
+      },
+
+      tick(t, dtMs) {
+        const dt = Math.min((dtMs || 0) / 1000, 0.1);
+        if (this.running) {
+          let mx = input.moveX, my = input.moveY;
+          const k = input.keys;
+          if (k.KeyW || k.ArrowUp) my += 1;
+          if (k.KeyS || k.ArrowDown) my -= 1;
+          if (k.KeyA || k.ArrowLeft) mx -= 1;
+          if (k.KeyD || k.ArrowRight) mx += 1;
+          const len = Math.hypot(mx, my);
+          if (len > 1) { mx /= len; my /= len; }
+
+          const sin = Math.sin(yaw), cos = Math.cos(yaw);
+          const dx = (cos * mx - sin * my) * SPEED * dt;
+          const dz = (-sin * mx - cos * my) * SPEED * dt;
+          if (!this.blocked(this.pos.x + dx, this.pos.z)) this.pos.x += dx;
+          if (!this.blocked(this.pos.x, this.pos.z + dz)) this.pos.z += dz;
+
+          for (const c of this.crystals) {
+            if (!c.taken && Math.hypot(c.x - this.pos.x, c.z - this.pos.z) < PICKUP) {
+              c.taken = true;
+              c.el.setAttribute('visible', false);
+              this.found++;
+            }
+          }
+          this.elapsed += dt;
+          this.updateHud();
+          if (this.found === this.crystals.length) this.win();
+        }
+        this.rig.object3D.position.set(this.pos.x, 0, this.pos.z);
+        this.rig.object3D.rotation.y = yaw;
+        this.cam.object3D.rotation.x = pitch;
+      },
+
+      win() {
+        this.running = false;
+        document.getElementById('winText').textContent =
+          `You collected all ${this.crystals.length} crystals in ${this.elapsed.toFixed(1)} seconds.`;
+        document.getElementById('winPanel').hidden = false;
+      }
+    });
+
+    // ---- Touch and mouse controls ----
+    const controls = document.getElementById('controls');
+    const base = document.getElementById('stickBase');
+    const knob = document.getElementById('stickKnob');
+    const STICK_R = 60;
+    let movePointer = null, moveOrigin = null;
+    const lookPointers = new Map();
+
+    controls.addEventListener('pointerdown', e => {
+      try { controls.setPointerCapture(e.pointerId); } catch (err) {}
+      if (e.pointerType !== 'mouse' && e.clientX < window.innerWidth / 2 && movePointer === null) {
+        movePointer = e.pointerId;
+        moveOrigin = { x: e.clientX, y: e.clientY };
+        for (const el of [base, knob]) {
+          el.style.display = 'block';
+          el.style.left = e.clientX + 'px';
+          el.style.top = e.clientY + 'px';
+        }
+      } else {
+        lookPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      }
+    });
+
+    controls.addEventListener('pointermove', e => {
+      if (e.pointerId === movePointer) {
+        let dx = e.clientX - moveOrigin.x, dy = e.clientY - moveOrigin.y;
+        const d = Math.hypot(dx, dy);
+        if (d > STICK_R) { dx *= STICK_R / d; dy *= STICK_R / d; }
+        knob.style.left = (moveOrigin.x + dx) + 'px';
+        knob.style.top = (moveOrigin.y + dy) + 'px';
+        input.moveX = dx / STICK_R;
+        input.moveY = -dy / STICK_R;
+      } else if (lookPointers.has(e.pointerId)) {
+        const last = lookPointers.get(e.pointerId);
+        const sens = e.pointerType === 'mouse' ? 0.004 : 0.006;
+        yaw -= (e.clientX - last.x) * sens;
+        pitch -= (e.clientY - last.y) * sens;
+        pitch = Math.max(-1.2, Math.min(1.2, pitch));
+        lookPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      }
+    });
+
+    function endPointer(e) {
+      if (e.pointerId === movePointer) {
+        movePointer = null;
+        input.moveX = input.moveY = 0;
+        base.style.display = knob.style.display = 'none';
+      }
+      lookPointers.delete(e.pointerId);
+    }
+    controls.addEventListener('pointerup', endPointer);
+    controls.addEventListener('pointercancel', endPointer);
+    controls.addEventListener('contextmenu', e => e.preventDefault());
+
+    window.addEventListener('keydown', e => { input.keys[e.code] = true; });
+    window.addEventListener('keyup', e => { input.keys[e.code] = false; });
+    window.addEventListener('blur', () => { input.keys = {}; });
+
+    // ---- Panels ----
+    function game() { return document.getElementById('scene').components.game; }
+    document.getElementById('startBtn').addEventListener('click', () => {
+      document.getElementById('startPanel').hidden = true;
+      const g = game(); g.reset(); g.running = true;
+    });
+    document.getElementById('againBtn').addEventListener('click', () => {
+      document.getElementById('winPanel').hidden = true;
+      const g = game(); g.reset(); g.running = true;
+    });
+    document.getElementById('fsBtn').addEventListener('click', () => {
+      const el = document.documentElement;
+      const req = el.requestFullscreen || el.webkitRequestFullscreen;
+      if (document.fullscreenElement || document.webkitFullscreenElement) {
+        (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+      } else if (req) {
+        Promise.resolve(req.call(el)).catch(() => {});
+      }
+    });
+  </script>
+</body>
+</html>
